@@ -1,4 +1,4 @@
-# HW1 – Lane Dodger (Biker)
+# Android Car Game
 
 ## Overview
 This Android mini-game is a simple lane dodger built with **Kotlin** and **Android Studio** (API 30 / Android 11).  
