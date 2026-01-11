@@ -1,60 +1,120 @@
 package com.example.hw1
 
-import android.graphics.Rect
-import android.os.Build
+import android.Manifest
+import android.content.Context
+import android.content.pm.PackageManager
+import android.hardware.Sensor
+import android.hardware.SensorEvent
+import android.hardware.SensorEventListener
+import android.hardware.SensorManager
 import android.os.Bundle
+import android.os.Handler
+import android.os.Looper
 import android.os.SystemClock
-import android.os.VibrationEffect
-import android.os.Vibrator
-import android.view.Choreographer
+import android.view.Gravity
 import android.view.View
+import android.animation.ObjectAnimator
+import android.widget.FrameLayout
 import android.widget.ImageView
-import android.widget.Toast
+import android.widget.LinearLayout
+import androidx.activity.result.contract.ActivityResultContracts
 import androidx.appcompat.app.AlertDialog
 import androidx.appcompat.app.AppCompatActivity
-import androidx.constraintlayout.widget.ConstraintLayout
-import androidx.constraintlayout.widget.ConstraintSet
-import androidx.constraintlayout.widget.Guideline
+import androidx.core.content.ContextCompat
+import androidx.lifecycle.lifecycleScope
+import com.example.hw1.data.ScoreEntity
+import com.example.hw1.data.ScoreRepository
 import com.example.hw1.databinding.ActivityMainBinding
-import kotlin.math.max
-import kotlin.math.min
-import kotlin.random.Random
+import com.example.hw1.game.GameConfig
+import com.example.hw1.game.GameEngine
+import com.example.hw1.game.GameMode
+import com.example.hw1.game.GameState
+import com.example.hw1.services.AndroidHaptics
+import com.example.hw1.services.AndroidSfx
+import com.example.hw1.services.Haptics
+import com.example.hw1.services.Sfx
+import com.google.android.gms.location.FusedLocationProviderClient
+import com.google.android.gms.location.LocationServices
+import com.google.android.gms.location.Priority
+import com.google.android.gms.tasks.CancellationTokenSource
+import kotlinx.coroutines.Dispatchers
+import kotlinx.coroutines.launch
+import kotlin.math.abs
 
-class MainActivity : AppCompatActivity() {
+class MainActivity : AppCompatActivity(), GameEngine.Listener, SensorEventListener {
+
+    companion object {
+        const val EXTRA_MODE = "extra_mode"
+    }
+
+    private data class ModeSettings(
+        val tickMs: Long,
+        val spawnEveryTicks: Int,
+        val coinEveryTicks: Int,
+        val distancePerTick: Int,
+        val enablePitchSpeed: Boolean
+    )
 
     private lateinit var b: ActivityMainBinding
+    private lateinit var engine: GameEngine
+    private lateinit var haptics: Haptics
+    private lateinit var sfx: Sfx
+    private lateinit var repo: ScoreRepository
+    private lateinit var fusedLocationClient: FusedLocationProviderClient
 
-    private val LANE_COUNT = 3
-    private val SPAWN_EVERY_MS = 650L
-    private val SPEED_PX_PER_SEC = 820f
-    private val CRASH_COOLDOWN_MS = 350L
-
-    private var laneIndex = LANE_COUNT / 2
-    private var lives = 3
-
-    private lateinit var car: ImageView
-    private lateinit var laneGuides: IntArray
-
-    private data class Obstacle(val view: ImageView, var lane: Int)
-    private val obstacles = ArrayList<Obstacle>(16)
-
-    private var lastSpawnMs = 0L
-    private var lastCrashMs = 0L
-
+    private val handler = Handler(Looper.getMainLooper())
     private var running = false
-    private var lastFrameNanos = 0L
-
     private var isGameOver = false
     private var gameOverDialog: AlertDialog? = null
+    private var boardReady = false
 
-    private val frameCallback = object : Choreographer.FrameCallback {
-        override fun doFrame(frameTimeNanos: Long) {
+    private lateinit var obstacleCells: Array<Array<ImageView>>
+    private lateinit var coinCells: Array<Array<ImageView>>
+    private lateinit var playerCells: Array<ImageView>
+
+    private var currentTickMs = 300L
+    private var baseTickMs = 300L
+
+    private var mode: GameMode = GameMode.SLOW
+    private lateinit var config: GameConfig
+    private lateinit var settings: ModeSettings
+
+    private val sensorManager by lazy {
+        getSystemService(Context.SENSOR_SERVICE) as SensorManager
+    }
+    private var sensor: Sensor? = null
+    private var tiltArmed = true
+    private var lastTiltMoveMs = 0L
+
+    private val tiltThresholdHigh = 3.2f
+    private val tiltThresholdLow = 1.6f
+    private val tiltDebounceMs = 180L
+
+    private val pitchMin = -6f
+    private val pitchMax = 6f
+    private val minTickMs = 150L
+    private val maxTickMs = 420L
+
+    private var pendingFinalState: GameState? = null
+    private var crashShake: ObjectAnimator? = null
+
+    private val locationPermissionLauncher = registerForActivityResult(
+        ActivityResultContracts.RequestPermission()
+    ) { granted ->
+        val state = pendingFinalState ?: return@registerForActivityResult
+        if (granted) {
+            fetchLocationAndSave(state)
+        } else {
+            saveScore(state, null, null)
+        }
+        pendingFinalState = null
+    }
+
+    private val tickRunnable = object : Runnable {
+        override fun run() {
             if (!running) return
-            if (lastFrameNanos == 0L) lastFrameNanos = frameTimeNanos
-            val dtSec = (frameTimeNanos - lastFrameNanos) / 1_000_000_000f
-            lastFrameNanos = frameTimeNanos
-            tick(dtSec)
-            Choreographer.getInstance().postFrameCallback(this)
+            engine.tick()
+            handler.postDelayed(this, currentTickMs)
         }
     }
 
@@ -63,103 +123,330 @@ class MainActivity : AppCompatActivity() {
         b = ActivityMainBinding.inflate(layoutInflater)
         setContentView(b.root)
 
-        b.btnLeft.setOnClickListener { moveCarBy(-1) }
-        b.btnRight.setOnClickListener { moveCarBy(+1) }
+        requestLocationPermissionIfNeeded()
+
+        mode = parseMode(intent.getStringExtra(EXTRA_MODE))
+        settings = settingsForMode(mode)
+        config = GameConfig(
+            lanes = 5,
+            rows = 12,
+            lives = 3,
+            spawnEveryTicks = settings.spawnEveryTicks,
+            coinEveryTicks = settings.coinEveryTicks,
+            distancePerTick = settings.distancePerTick
+        )
+
+        baseTickMs = settings.tickMs
+        currentTickMs = baseTickMs
+
+        haptics = AndroidHaptics(this)
+        sfx = AndroidSfx(this)
+        repo = ScoreRepository.getInstance(applicationContext)
+        fusedLocationClient = LocationServices.getFusedLocationProviderClient(this)
+
+        engine = GameEngine(config).also { it.listener = this }
+
+        b.btnLeft.setOnClickListener { engine.moveRight() }
+        b.btnRight.setOnClickListener { engine.moveLeft() }
+
+        applyModeUi()
 
         b.road.post {
-            buildLanes(b.road as ConstraintLayout, LANE_COUNT)
-            buildCar(b.road as ConstraintLayout)
-            resetGame()
+            buildBoard()
+            engine.reset()
             startLoop()
         }
     }
 
     override fun onResume() {
         super.onResume()
-        b.road.post {
-            if (!isGameOver && ::laneGuides.isInitialized && ::car.isInitialized) startLoop()
-        }
+        if (mode == GameMode.SENSOR) registerSensor()
+        if (!isGameOver && boardReady) startLoop()
     }
 
     override fun onPause() {
         super.onPause()
+        if (mode == GameMode.SENSOR) sensorManager.unregisterListener(this)
         gameOverDialog?.dismiss()
         stopLoop()
     }
 
+    override fun onDestroy() {
+        super.onDestroy()
+        sfx.release()
+    }
+
     private fun startLoop() {
-        if (running || isGameOver) return
+        if (running || isGameOver || !boardReady) return
         running = true
-        lastFrameNanos = 0L
-        Choreographer.getInstance().postFrameCallback(frameCallback)
+        handler.post(tickRunnable)
     }
 
     private fun stopLoop() {
         running = false
-        lastFrameNanos = 0L
-        Choreographer.getInstance().removeFrameCallback(frameCallback)
+        handler.removeCallbacks(tickRunnable)
     }
 
-    private fun tick(dtSec: Float) {
-        if (isGameOver) return
-        if (!::laneGuides.isInitialized || !::car.isInitialized) return
+    private fun buildBoard() {
+        boardReady = false
+        val road = b.road
+        road.removeAllViews()
 
+        obstacleCells = Array(config.rows) { Array(config.lanes) { ImageView(this) } }
+        coinCells = Array(config.rows) { Array(config.lanes) { ImageView(this) } }
+        playerCells = Array(config.lanes) { ImageView(this) }
+
+        val obstacleSize = dp(40)
+        val coinSize = dp(26)
+        val playerSize = dp(44)
+        val playerRow = config.rows - 1
+
+        for (row in 0 until config.rows) {
+            val rowLayout = LinearLayout(this).apply {
+                orientation = LinearLayout.HORIZONTAL
+                layoutParams = LinearLayout.LayoutParams(
+                    LinearLayout.LayoutParams.MATCH_PARENT,
+                    0,
+                    1f
+                )
+            }
+
+            for (lane in 0 until config.lanes) {
+                val cell = FrameLayout(this).apply {
+                    layoutParams = LinearLayout.LayoutParams(
+                        0,
+                        LinearLayout.LayoutParams.MATCH_PARENT,
+                        1f
+                    )
+                }
+
+                val obstacle = ImageView(this).apply {
+                    setImageResource(R.drawable.ic_block)
+                    alpha = 0f
+                }
+                val obstacleLp = FrameLayout.LayoutParams(
+                    obstacleSize,
+                    obstacleSize,
+                    Gravity.CENTER
+                )
+                cell.addView(obstacle, obstacleLp)
+                obstacleCells[row][lane] = obstacle
+
+                val coin = ImageView(this).apply {
+                    setImageResource(R.drawable.ic_coin)
+                    alpha = 0f
+                }
+                val coinLp = FrameLayout.LayoutParams(
+                    coinSize,
+                    coinSize,
+                    Gravity.CENTER
+                )
+                cell.addView(coin, coinLp)
+                coinCells[row][lane] = coin
+
+                if (row == playerRow) {
+                    val player = ImageView(this).apply {
+                        setImageResource(R.drawable.ic_biker)
+                        alpha = 0f
+                    }
+                    val playerLp = FrameLayout.LayoutParams(
+                        playerSize,
+                        playerSize,
+                        Gravity.CENTER
+                    )
+                    cell.addView(player, playerLp)
+                    playerCells[lane] = player
+                }
+
+                rowLayout.addView(cell)
+
+                if (lane < config.lanes - 1) {
+                    val divider = View(this).apply {
+                        setBackgroundColor(0x80FFFFFF.toInt())
+                        alpha = if (row % 2 == 0) 0.6f else 0.2f
+                    }
+                    val dividerLp = LinearLayout.LayoutParams(
+                        dp(2),
+                        LinearLayout.LayoutParams.MATCH_PARENT
+                    )
+                    rowLayout.addView(divider, dividerLp)
+                }
+            }
+
+            road.addView(rowLayout)
+        }
+        boardReady = true
+    }
+
+    private fun renderState(state: GameState) {
+        for (row in 0 until state.rows) {
+            for (lane in 0 until state.lanes) {
+                obstacleCells[row][lane].alpha = if (state.obstacles[row][lane]) 1f else 0f
+                coinCells[row][lane].alpha = if (state.coinGrid[row][lane]) 1f else 0f
+            }
+        }
+
+        for (lane in 0 until state.lanes) {
+            playerCells[lane].alpha = if (lane == state.playerLane) 1f else 0f
+        }
+
+        b.heart1.alpha = if (state.lives >= 1) 1f else 0.2f
+        b.heart2.alpha = if (state.lives >= 2) 1f else 0.2f
+        b.heart3.alpha = if (state.lives >= 3) 1f else 0.2f
+
+        b.distanceText.text = "Distance: ${state.distance}"
+        b.coinsText.text = "Coins: ${state.coins}"
+    }
+
+    private fun applyModeUi() {
+        b.modeText.text = "Mode: ${mode.name}"
+        b.controlBar.visibility = if (mode == GameMode.SENSOR) View.GONE else View.VISIBLE
+    }
+
+    private fun registerSensor() {
+        sensor = sensorManager.getDefaultSensor(Sensor.TYPE_GRAVITY)
+            ?: sensorManager.getDefaultSensor(Sensor.TYPE_ACCELEROMETER)
+        val activeSensor = sensor
+        if (activeSensor == null) {
+            b.controlBar.visibility = View.VISIBLE
+            return
+        }
+        sensorManager.registerListener(this, activeSensor, SensorManager.SENSOR_DELAY_GAME)
+    }
+
+    override fun onSensorChanged(event: SensorEvent) {
+        if (mode != GameMode.SENSOR) return
+        val x = event.values[0]
+        val y = event.values[1]
         val now = SystemClock.uptimeMillis()
 
-        if (now - lastSpawnMs >= SPAWN_EVERY_MS) {
-            lastSpawnMs = now
-            spawnObstacle()
+        if (tiltArmed && now - lastTiltMoveMs > tiltDebounceMs) {
+            when {
+                x > tiltThresholdHigh -> {
+                    engine.moveRight()
+                    tiltArmed = false
+                    lastTiltMoveMs = now
+                }
+                x < -tiltThresholdHigh -> {
+                    engine.moveLeft()
+                    tiltArmed = false
+                    lastTiltMoveMs = now
+                }
+            }
         }
 
-        val dy = (SPEED_PX_PER_SEC * dtSec).toInt()
-        val roadH = b.road.height
+        if (!tiltArmed && abs(x) < tiltThresholdLow) {
+            tiltArmed = true
+        }
 
-        var i = 0
-        while (i < obstacles.size) {
-            val o = obstacles[i]
-            val lp = o.view.layoutParams as ConstraintLayout.LayoutParams
-            lp.topMargin = lp.topMargin + dy
-            o.view.layoutParams = lp
-
-            if (lp.topMargin > roadH + o.view.height) {
-                (b.road as ConstraintLayout).removeView(o.view)
-                obstacles.removeAt(i)
-                continue
-            }
-
-            if (isColliding(car, o.view)) {
-                handleCrash(o, now)
-                continue
-            }
-
-            i++
+        if (settings.enablePitchSpeed) {
+            val normalized = ((-y - pitchMin) / (pitchMax - pitchMin)).coerceIn(0f, 1f)
+            currentTickMs = (maxTickMs - (maxTickMs - minTickMs) * normalized).toLong()
+        } else {
+            currentTickMs = baseTickMs
         }
     }
 
-    private fun handleCrash(o: Obstacle, nowMs: Long) {
-        if (nowMs - lastCrashMs < CRASH_COOLDOWN_MS) return
-        lastCrashMs = nowMs
+    override fun onAccuracyChanged(sensor: Sensor?, accuracy: Int) = Unit
 
-        (b.road as ConstraintLayout).removeView(o.view)
-        obstacles.remove(o)
+    override fun onStateChanged(state: GameState) {
+        if (!boardReady) return
+        renderState(state)
+    }
 
-        lives--
-        updateHearts()
+    override fun onCrash(livesLeft: Int) {
+        haptics.vibrateCrash()
+        sfx.playCrash()
+        shakeOnCrash()
+    }
 
-        vibrate(60)
-        Toast.makeText(this, "Crash!", Toast.LENGTH_SHORT).show()
+    override fun onGameOver(finalState: GameState) {
+        if (isGameOver) return
+        isGameOver = true
+        haptics.vibrateGameOver()
+        stopLoop()
+        saveScoreWithLocation(finalState)
+        showGameOverDialog()
+    }
 
-        if (lives <= 0) {
-            vibrate(140)
-            showGameOverDialog()
+    private fun saveScoreWithLocation(state: GameState) {
+        if (ContextCompat.checkSelfPermission(
+                this,
+                Manifest.permission.ACCESS_FINE_LOCATION
+            ) == PackageManager.PERMISSION_GRANTED
+        ) {
+            fetchLocationAndSave(state)
+        } else {
+            pendingFinalState = state
+            locationPermissionLauncher.launch(Manifest.permission.ACCESS_FINE_LOCATION)
+        }
+    }
+
+    private fun requestLocationPermissionIfNeeded() {
+        if (ContextCompat.checkSelfPermission(
+                this,
+                Manifest.permission.ACCESS_FINE_LOCATION
+            ) == PackageManager.PERMISSION_GRANTED
+        ) return
+        locationPermissionLauncher.launch(Manifest.permission.ACCESS_FINE_LOCATION)
+    }
+
+    private fun fetchLocationAndSave(state: GameState) {
+        val tokenSource = CancellationTokenSource()
+        var handled = false
+        val timeout = Runnable {
+            if (handled) return@Runnable
+            handled = true
+            tokenSource.cancel()
+            fetchLastLocationAndSave(state)
+        }
+
+        handler.postDelayed(timeout, 2000L)
+        fusedLocationClient.getCurrentLocation(
+            Priority.PRIORITY_BALANCED_POWER_ACCURACY,
+            tokenSource.token
+        ).addOnSuccessListener { location ->
+            if (handled) return@addOnSuccessListener
+            handled = true
+            handler.removeCallbacks(timeout)
+            if (location != null) {
+                saveScore(state, location.latitude, location.longitude)
+            } else {
+                fetchLastLocationAndSave(state)
+            }
+        }.addOnFailureListener {
+            if (handled) return@addOnFailureListener
+            handled = true
+            handler.removeCallbacks(timeout)
+            fetchLastLocationAndSave(state)
+        }
+    }
+
+    private fun fetchLastLocationAndSave(state: GameState) {
+        fusedLocationClient.lastLocation
+            .addOnSuccessListener { location ->
+                saveScore(state, location?.latitude, location?.longitude)
+            }
+            .addOnFailureListener {
+                saveScore(state, null, null)
+            }
+    }
+
+    private fun saveScore(state: GameState, latitude: Double?, longitude: Double?) {
+        val score = ScoreEntity(
+            mode = mode.name,
+            distance = state.distance,
+            coins = state.coins,
+            timestamp = System.currentTimeMillis(),
+            latitude = latitude,
+            longitude = longitude
+        )
+        lifecycleScope.launch(Dispatchers.IO) {
+            repo.addScore(score)
         }
     }
 
     private fun showGameOverDialog() {
-        if (isGameOver) return
-        isGameOver = true
-        stopLoop()
-
         gameOverDialog?.dismiss()
         gameOverDialog = AlertDialog.Builder(this)
             .setTitle("Game Over")
@@ -167,7 +454,8 @@ class MainActivity : AppCompatActivity() {
             .setCancelable(false)
             .setPositiveButton("Restart") { _, _ ->
                 isGameOver = false
-                resetGame()
+                currentTickMs = baseTickMs
+                engine.reset()
                 startLoop()
             }
             .setNegativeButton("Exit") { _, _ ->
@@ -178,149 +466,55 @@ class MainActivity : AppCompatActivity() {
         gameOverDialog?.show()
     }
 
-    private fun resetGame() {
-        val road = b.road as ConstraintLayout
-        for (o in obstacles) road.removeView(o.view)
-        obstacles.clear()
-
-        isGameOver = false
-
-        lives = 3
-        updateHearts()
-
-        laneIndex = LANE_COUNT / 2
-        placeCarAtLane(laneIndex)
-
-        lastSpawnMs = SystemClock.uptimeMillis()
-        lastCrashMs = 0L
-    }
-
-    private fun updateHearts() {
-        b.heart1.alpha = if (lives >= 1) 1f else 0.2f
-        b.heart2.alpha = if (lives >= 2) 1f else 0.2f
-        b.heart3.alpha = if (lives >= 3) 1f else 0.2f
-    }
-
-    private fun moveCarBy(delta: Int) {
-        if (isGameOver) return
-        val next = min(LANE_COUNT - 1, max(0, laneIndex + delta))
-        if (next == laneIndex) return
-        laneIndex = next
-        placeCarAtLane(laneIndex)
-    }
-
-    private fun placeCarAtLane(lane: Int) {
-        val road = b.road as ConstraintLayout
-        val cs = ConstraintSet()
-        cs.clone(road)
-
-        val leftId = if (lane == 0) ConstraintSet.PARENT_ID else laneGuides[lane - 1]
-        val rightId = if (lane == LANE_COUNT - 1) ConstraintSet.PARENT_ID else laneGuides[lane]
-
-        cs.clear(car.id, ConstraintSet.START)
-        cs.clear(car.id, ConstraintSet.END)
-
-        cs.connect(car.id, ConstraintSet.START, leftId, ConstraintSet.START, 0)
-        cs.connect(car.id, ConstraintSet.END, rightId, ConstraintSet.END, 0)
-        cs.setHorizontalBias(car.id, 0.5f)
-
-        cs.applyTo(road)
-    }
-
-    private fun spawnObstacle() {
-        val road = b.road as ConstraintLayout
-        val lane = Random.nextInt(LANE_COUNT)
-
-        val v = ImageView(this).apply {
-            id = View.generateViewId()
-            setImageResource(R.drawable.ic_block)
-        }
-
-        val size = dp(40)
-
-        val leftId = if (lane == 0) ConstraintSet.PARENT_ID else laneGuides[lane - 1]
-        val rightId = if (lane == LANE_COUNT - 1) ConstraintSet.PARENT_ID else laneGuides[lane]
-
-        val lp = ConstraintLayout.LayoutParams(size, size).apply {
-            topToTop = ConstraintSet.PARENT_ID
-            topMargin = -size
-            startToStart = leftId
-            endToEnd = rightId
-            horizontalBias = 0.5f
-        }
-
-        road.addView(v, lp)
-        obstacles.add(Obstacle(v, lane))
-    }
-
-    private fun isColliding(a: View, b: View): Boolean {
-        val ra = Rect()
-        val rb = Rect()
-        a.getHitRect(ra)
-        b.getHitRect(rb)
-        return Rect.intersects(ra, rb)
-    }
-
-    private fun vibrate(ms: Long) {
-        val vib = getSystemService(VIBRATOR_SERVICE) as Vibrator
-        if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.O) {
-            vib.vibrate(VibrationEffect.createOneShot(ms, VibrationEffect.DEFAULT_AMPLITUDE))
-        } else {
-            @Suppress("DEPRECATION")
-            vib.vibrate(ms)
+    private fun parseMode(value: String?): GameMode {
+        return try {
+            GameMode.valueOf(value ?: GameMode.SLOW.name)
+        } catch (_: IllegalArgumentException) {
+            GameMode.SLOW
         }
     }
 
-    private fun buildCar(road: ConstraintLayout) {
-        car = ImageView(this).apply {
-            id = View.generateViewId()
-            setImageResource(R.drawable.ic_biker)
+    private fun settingsForMode(mode: GameMode): ModeSettings {
+        return when (mode) {
+            GameMode.SLOW -> ModeSettings(
+                tickMs = 360L,
+                spawnEveryTicks = 4,
+                coinEveryTicks = 3,
+                distancePerTick = 1,
+                enablePitchSpeed = false
+            )
+            GameMode.FAST -> ModeSettings(
+                tickMs = 220L,
+                spawnEveryTicks = 3,
+                coinEveryTicks = 2,
+                distancePerTick = 2,
+                enablePitchSpeed = false
+            )
+            GameMode.SENSOR -> ModeSettings(
+                tickMs = 280L,
+                spawnEveryTicks = 3,
+                coinEveryTicks = 2,
+                distancePerTick = 2,
+                enablePitchSpeed = true
+            )
         }
-
-        val size = dp(44)
-
-        val leftId = if (laneIndex == 0) ConstraintSet.PARENT_ID else laneGuides[laneIndex - 1]
-        val rightId = if (laneIndex == LANE_COUNT - 1) ConstraintSet.PARENT_ID else laneGuides[laneIndex]
-
-        val lp = ConstraintLayout.LayoutParams(size, size).apply {
-            bottomToBottom = ConstraintSet.PARENT_ID
-            bottomMargin = dp(14)
-            startToStart = leftId
-            endToEnd = rightId
-            horizontalBias = 0.5f
-        }
-
-        road.addView(car, lp)
     }
 
-    private fun buildLanes(road: ConstraintLayout, lanes: Int) {
-        road.removeAllViews()
-
-        laneGuides = IntArray(lanes - 1)
-
-        for (i in 1 until lanes) {
-            val g = Guideline(this).apply { id = View.generateViewId() }
-            val glp = ConstraintLayout.LayoutParams(
-                ConstraintLayout.LayoutParams.WRAP_CONTENT,
-                ConstraintLayout.LayoutParams.WRAP_CONTENT
-            ).apply {
-                orientation = ConstraintLayout.LayoutParams.VERTICAL
-                guidePercent = i / lanes.toFloat()
-            }
-            road.addView(g, glp)
-            laneGuides[i - 1] = g.id
-
-            val line = View(this).apply {
-                id = View.generateViewId()
-                setBackgroundColor(0x55FFFFFF.toInt())
-            }
-            val lp = ConstraintLayout.LayoutParams(dp(2), 0).apply {
-                topToTop = ConstraintSet.PARENT_ID
-                bottomToBottom = ConstraintSet.PARENT_ID
-                startToStart = g.id
-                endToEnd = g.id
-            }
-            road.addView(line, lp)
+    private fun shakeOnCrash() {
+        val dx = dp(8).toFloat()
+        crashShake?.cancel()
+        crashShake = ObjectAnimator.ofFloat(
+            b.road,
+            "translationX",
+            0f,
+            -dx,
+            dx,
+            -dx * 0.7f,
+            dx * 0.7f,
+            0f
+        ).apply {
+            duration = 180L
+            start()
         }
     }
 
