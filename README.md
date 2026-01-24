@@ -1,38 +1,40 @@
 # Android Car Game
 
 ## Overview
-This Android mini-game is a simple lane dodger built with **Kotlin** and **Android Studio** (API 30 / Android 11).  
-You control a **biker** at the bottom of the road and avoid incoming obstacles that fall from the top.
+An Android mini-game built with Kotlin and Android Studio. You drive a biker down a lane-based road, dodge obstacles, collect coins, and rack up distance. The game targets API 30 compatibility while running on newer SDKs.
 
 ## Gameplay
-- The road is split into **3 lanes**.
-- Obstacles spawn at the top in random lanes and move downward continuously.
-- The biker can move **left / right** between lanes.
-- You start with **3 lives** (hearts). Each collision removes one life.
-- When lives reach **0**, the game **stops** and a dialog appears:
-  - **Restart**: starts a new run
-  - **Exit**: closes the app
+- 5 lanes, 12 rows, grid-based movement (no Canvas, no coordinate movement).
+- Obstacles and coins spawn over time; visibility is toggled on a pre-built board.
+- You start with 3 lives; collisions reduce lives and trigger a crash effect.
+- Game ends at 0 lives with a restart/exit dialog.
 
-## Controls
-- **Left button**: move biker one lane left  
-- **Right button**: move biker one lane right
+## Modes and Controls
+- **SLOW** and **FAST**: use on-screen left/right buttons.
+- **SENSOR**: tilt to change lanes; tilt pitch controls speed.
 
-## Technical Notes (What’s inside)
-- **No Canvas**
-- Lane positioning is done with **ConstraintLayout guidelines**
-- Falling motion is done by updating **LayoutParams topMargin** per frame (no `x/y` usage)
-- Main loop uses **Choreographer** for smooth frame timing
-- Collision detection uses `getHitRect()` + `Rect.intersects()`
-- Vibration feedback on crash and game over
+## High Scores
+- Top 10 scores per mode are stored via Room.
+- Each score shows distance, coins, time, and location when available.
+- A small map (lite mode) renders the score location per entry.
+- City names are resolved from GPS coordinates when possible.
 
-## Project Structure (Key Files)
-- `app/src/main/java/com/example/hw1/MainActivity.kt`  
-  Game loop, lanes, spawning, collisions, game over dialog
-- `app/src/main/res/layout/activity_main.xml`  
-  UI layout (road area + controls + hearts)
-- `app/src/main/res/drawable/`
-  - `ic_biker.xml` (player)
-  - `ic_block.xml` (obstacle)
-  - `ic_left.xml`, `ic_right.xml` (buttons)
-  - `ic_heart.xml` (lives)
-  - `bg_road.xml` (roa_
+## Audio and Haptics
+- Crash feedback uses vibration and a deeper, layered crash sound.
+- Game over also triggers haptic feedback.
+
+## Setup Notes
+- Set a valid Maps API key in `app/src/main/res/values/strings.xml` as `google_maps_key` (do not commit real keys).
+- Location permission is required to store coordinates for high score maps.
+
+## Key Files
+- `app/src/main/java/com/example/hw1/MainActivity.kt`: game loop, input, crash/game-over handling.
+- `app/src/main/java/com/example/hw1/HighScoresActivity.kt`: score list + per-entry map.
+- `app/src/main/java/com/example/hw1/game/`: game engine and state.
+- `app/src/main/java/com/example/hw1/data/`: Room database and repository.
+
+## Build and Run
+- `./gradlew assembleDebug`
+- `./gradlew test`
+- `./gradlew connectedAndroidTest`
+- `./gradlew lint`
